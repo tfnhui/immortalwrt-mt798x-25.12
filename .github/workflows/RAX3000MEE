@@ -1,0 +1,188 @@
+name: RAX3000MEe
+
+on:
+  push:
+    branches:
+      - 25.12
+    paths:
+      - '.github/workflows/rax3000me.yml'
+      - 'defconfig/rax3000me-openclash.config'
+      - 'scripts/**'
+  pull_request:
+    branches:
+      - 25.12
+    paths:
+      - '.github/workflows/rax3000me.yml'
+      - 'defconfig/rax3000me-openclash.config'
+      - 'scripts/**'
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: '开启调试模式 (显示详细日志)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  REPO_URL: https://github.com/hnjjw2024/immortalwrt-mt798x-25.12.git
+  REPO_BRANCH: 25.12
+  CONFIG_FILE: defconfig/rax3000me-openclash.config
+  TARGET_PROFILE: mediatek/filogic
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Build RAX3000M-E (${{ github.ref_name }})
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      actions: write
+    
+    steps:
+      - name: 初始化环境
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses5-dev \
+            libssl-dev python3-distutils python3-setuptools rsync \
+            swig unzip zlib1g-dev file wget make ccache libelf-dev \
+            libgmp3-dev libmpc-dev libzstd-dev
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "$TZ"
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: 克隆源码
+        run: |
+          git clone --single-branch --branch ${{ env.REPO_BRANCH }} ${{ env.REPO_URL }} openwrt
+          cd openwrt
+          echo "BUILD_DATE=$(date +'%Y%m%d%H%M')" >> $GITHUB_ENV
+          echo "VERSION=$(cat package/emortal/default-settings/files/etc/openwrt_version 2>/dev/null || echo '25.12')" >> $GITHUB_ENV
+
+      - name: 更新并安装 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 应用配置文件
+        run: |
+          cd openwrt
+          cp ${{ env.CONFIG_FILE }} .config
+          # 同步配置，解决 "configuration is out of sync" 警告
+          make defconfig
+
+      - name: 下载源码包 (带重试)
+        run: |
+          cd openwrt
+          make download -j$(nproc) || make download -j1 V=s
+
+      - name: 编译固件
+        run: |
+          cd openwrt
+          
+          # 根据输入决定是否启用调试模式
+          if [[ "${{ github.event.inputs.debug_enabled }}" == "true" ]]; then
+            VERBOSE="V=s"
+            PARALLEL="-j1"
+          else
+            VERBOSE="V=sc"
+            PARALLEL="-j$(nproc)"
+          fi
+          
+          # 开始编译：单线程 + 详细日志便于排查错误
+          # 如果失败，自动切换到单线程模式重试
+          make $PARALLEL $VERBOSE || make -j1 V=s
+
+      - name: 清理输出目录
+        run: |
+          cd openwrt
+          # 删除不需要的 packages 目录，减小 artifacts 体积
+          rm -rf bin/targets/${{ env.TARGET_PROFILE }}/packages
+          # 保留关键文件
+          find bin/targets/ -type f -name "*.buildinfo" -delete
+          find bin/targets/ -type f -name "*.manifest" -delete
+          find bin/targets/ -type f -name "sha256sums" -delete
+
+      - name: 准备发布文件
+        if: env.UPLOAD_FIRMWARE == 'true'
+        run: |
+          cd openwrt
+          mkdir -p upload
+          # 复制固件文件
+          cp bin/targets/${{ env.TARGET_PROFILE }}/*.bin upload/ 2>/dev/null || true
+          cp bin/targets/${{ env.TARGET_PROFILE }}/*.itb upload/ 2>/dev/null || true
+          cp bin/targets/${{ env.TARGET_PROFILE }}/*.img upload/ 2>/dev/null || true
+          # 复制配置文件便于复现
+          cp .config upload/build.config
+          # 生成版本信息
+          echo "Build Date: ${{ env.BUILD_DATE }}" > upload/version.txt
+          echo "Commit: ${{ github.sha }}" >> upload/version.txt
+          echo "Branch: ${{ github.ref_name }}" >> upload/version.txt
+
+      - name: 上传固件到 Artifacts
+        if: env.UPLOAD_FIRMWARE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImmortalWrt-RAX3000M-E-${{ env.BUILD_DATE }}
+          path: openwrt/upload/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: 创建 GitHub Release
+        if: env.UPLOAD_RELEASE == 'true' && github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: RAX3000M-E-${{ env.BUILD_DATE }}
+          name: "ImmortalWrt for RAX3000M-E • ${{ env.BUILD_DATE }}"
+          body: |
+            ## 📦 固件信息
+            - **设备**: Xiaomi RAX3000M-E
+            - **分支**: ${{ github.ref_name }}
+            - **提交**: ${{ github.sha }}
+            - **构建时间**: ${{ env.BUILD_DATE }}
+            - **配置文件**: [查看 .config](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/${{ env.CONFIG_FILE }})
+            
+            ## 🔧 包含功能
+            - OpenClash 支持
+            - 常用网络工具
+            - LuCI 中文界面
+            
+            ## ⚠️ 注意事项
+            > 首次刷写建议使用官方固件作为基础，或通过 uboot 刷入。
+          files: |
+            openwrt/upload/*.bin
+            openwrt/upload/*.itb
+            openwrt/upload/*.img
+            openwrt/upload/build.config
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: 构建失败通知
+        if: failure()
+        run: |
+          echo "❌ 构建失败！请检查日志："
+          echo "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # 可在此添加 Telegram/DingTalk 通知逻辑
+
+      - name: 清理工作空间
+        if: always()
+        run: |
+          # 释放磁盘空间，避免后续任务失败
+          rm -rf openwrt/dl openwrt/build_dir
+          df -h

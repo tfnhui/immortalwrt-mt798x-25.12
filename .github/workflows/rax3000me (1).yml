@@ -1,0 +1,271 @@
+# ============================================================
+# RAX3000ME ImmortalWrt 25.12 固件自动编译 Workflow
+# 优化版本 - 修复了以下问题：
+#   1. 新增磁盘空间清理（防止编译中途磁盘满）
+#   2. 新增系统依赖安装步骤
+#   3. 新增 ccache + dl 目录缓存（大幅加速二次编译）
+#   4. 编译失败自动回退单线程重试
+#   5. 设置编译超时保护
+#   6. 日期使用 Asia/Shanghai 时区
+#   7. 升级 softprops/action-gh-release 到 v2
+#   8. Artifacts 设置合理保留天数
+#   9. 新增可选定时触发
+#  10. 增加 workflow_dispatch 手动输入参数
+# ============================================================
+
+name: 0RAX3000ME Build ImmortalWrt 25.12
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_openclash:
+        description: '使用 OpenClash 配置文件'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      upload_release:
+        description: '发布到 Release'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  # 可选：每周一凌晨2点（北京时间）自动检查上游更新触发编译
+  # schedule:
+  #   - cron: '0 18 * * 0'  # UTC 18:00 周日 = 北京时间周一 02:00
+
+env:
+  REPO_URL: https://github.com/hnjjw2024/immortalwrt-mt798x-25.12.git
+  REPO_BRANCH: 25.12
+  CONFIG_FILE: defconfig/rax3000me-openclash.config
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360  # 最长 6 小时，防止卡死耗尽 Actions 分钟
+
+    steps:
+      # ── 1. 检出当前仓库（用于读取自定义文件，如有） ──────────────────
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # ── 2. 设置北京时间日期 ────────────────────────────────────────────
+      - name: 获取构建日期（北京时间）
+        id: date
+        run: |
+          echo "date=$(TZ='Asia/Shanghai' date +'%Y%m%d')" >> $GITHUB_OUTPUT
+          echo "datetime=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+      # ── 3. 释放磁盘空间（关键：ubuntu-22.04 默认可用空间约 20GB，编译需要 25GB+） ──
+      - name: 释放磁盘空间
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false       # 保留 tool-cache（node/python 等）
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true      # 扩展 swap 至 8GB，防止内存不足
+
+      # ── 4. 安装编译依赖 ────────────────────────────────────────────────
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils \
+            bison build-essential bzip2 ccache clang cmake cpio curl \
+            device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+            g++-multilib git gnutls-dev gperf haveged help2man intltool \
+            lib32gcc-s1 libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+            libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev \
+            libncursesw5 libncursesw5-dev libpython3-dev libreadline-dev \
+            libssl-dev libtool libz-dev lrzsz mkisofs msmtp nano ninja-build \
+            p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply \
+            python3-docutils python3-pyelftools qemu-utils re2c rsync scons \
+            squashfs-tools subversion swig texinfo uglifyjs unzip vim wget \
+            xmlto xxd zlib1g-dev
+          sudo apt-get clean
+          sudo timedatectl set-timezone "$TZ"
+
+      # ── 5. 克隆源码 ───────────────────────────────────────────────────
+      - name: 克隆 ImmortalWrt 25.12 源码
+        run: |
+          git clone --depth=1 -b $REPO_BRANCH $REPO_URL openwrt
+          echo "源码克隆完成，当前提交："
+          git -C openwrt log --oneline -1
+
+      # ── 6. 恢复缓存（dl 包缓存 + ccache 编译器缓存） ──────────────────
+      - name: 恢复编译缓存
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            openwrt/dl
+            ~/.ccache
+          key: immortalwrt-25.12-rax3000me-${{ steps.date.outputs.date }}
+          restore-keys: |
+            immortalwrt-25.12-rax3000me-
+
+      # ── 7. 更新并安装 feeds ───────────────────────────────────────────
+      - name: 更新 Feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          # 二次 install 解决依赖冲突
+          ./scripts/feeds install -a
+
+      # ── 8. 导入配置文件 ───────────────────────────────────────────────
+      - name: 导入编译配置
+        run: |
+          cd openwrt
+          if [ "${{ github.event.inputs.use_openclash }}" = "true" ] || [ -z "${{ github.event.inputs.use_openclash }}" ]; then
+            echo "使用 OpenClash 配置：$CONFIG_FILE"
+            cp $CONFIG_FILE .config
+          else
+            echo "使用默认配置（无 OpenClash）"
+            cp defconfig/rax3000me.config .config 2>/dev/null || cp $CONFIG_FILE .config
+          fi
+          # 补全配置（将隐式依赖补全为显式）
+          make defconfig
+
+      # ── 9. 下载编译所需的源码包 ───────────────────────────────────────
+      - name: 下载软件包源码
+        run: |
+          cd openwrt
+          # 配置 ccache
+          export CCACHE_DIR=~/.ccache
+          make download -j$(nproc) V=s 2>&1 | tee /tmp/download.log
+          # 检查下载失败的包
+          grep -E "^ERROR|error:" /tmp/download.log | head -20 || true
+          # 删除下载失败的空文件
+          find dl -size -1024c -delete 2>/dev/null || true
+
+      # ── 10. 保存 dl 缓存（下载后立即保存，避免编译失败导致缓存丢失） ──
+      - name: 保存下载缓存
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            openwrt/dl
+            ~/.ccache
+          key: immortalwrt-25.12-rax3000me-${{ steps.date.outputs.date }}
+
+      # ── 11. 编译固件 ──────────────────────────────────────────────────
+      - name: 编译固件
+        id: compile
+        run: |
+          cd openwrt
+          export CCACHE_DIR=~/.ccache
+          ccache -M 10G  # 限制 ccache 最大 10GB
+
+          echo "CPU 核心数：$(nproc)"
+          echo "可用磁盘："
+          df -h
+
+          # 优先多线程编译，失败时自动回退单线程（便于看到具体报错）
+          echo "开始多线程编译（-j$(nproc)）..."
+          if make -j$(nproc) V=s 2>&1 | tee /tmp/build.log; then
+            echo "✅ 多线程编译成功"
+            echo "compile_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ 多线程编译失败，回退到单线程重试..."
+            if make -j1 V=s 2>&1 | tee /tmp/build_single.log; then
+              echo "✅ 单线程编译成功"
+              echo "compile_status=success" >> $GITHUB_OUTPUT
+            else
+              echo "❌ 单线程编译也失败"
+              echo "compile_status=failed" >> $GITHUB_OUTPUT
+              # 打印最后100行错误日志
+              tail -100 /tmp/build_single.log
+              exit 1
+            fi
+          fi
+
+          # 统计输出文件
+          echo "输出文件："
+          ls -lh bin/targets/mediatek/filogic/*.bin 2>/dev/null || true
+          ls -lh bin/targets/mediatek/filogic/*.itb 2>/dev/null || true
+
+      # ── 12. 整理输出文件 ──────────────────────────────────────────────
+      - name: 整理固件文件
+        id: organize
+        if: steps.compile.outputs.compile_status == 'success'
+        run: |
+          cd openwrt/bin/targets/mediatek/filogic/
+
+          # 删除 packages 目录（体积大且通常不需要上传）
+          rm -rf packages
+
+          # 生成 SHA256 校验文件
+          sha256sum * > sha256sums.txt 2>/dev/null || true
+
+          echo "最终固件文件列表："
+          ls -lh
+          echo "firmware_path=$(pwd)" >> $GITHUB_OUTPUT
+
+      # ── 13. 上传 Artifacts（用于临时下载，无需等 Release） ───────────
+      - name: 上传固件到 Artifacts
+        uses: actions/upload-artifact@v4
+        if: steps.compile.outputs.compile_status == 'success'
+        with:
+          name: immortalwrt-25.12-rax3000me-${{ steps.date.outputs.date }}-${{ github.run_number }}
+          path: openwrt/bin/targets/mediatek/filogic/
+          if-no-files-found: warn
+          retention-days: 7  # 7天后自动删除，节省存储配额
+
+      # ── 14. 上传编译日志（便于调试） ─────────────────────────────────
+      - name: 上传编译日志
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            /tmp/build.log
+            /tmp/build_single.log
+            /tmp/download.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+      # ── 15. 发布到 GitHub Release ────────────────────────────────────
+      - name: 发布到 Release
+        uses: softprops/action-gh-release@v2  # 升级到 v2
+        if: |
+          steps.compile.outputs.compile_status == 'success' &&
+          (github.event.inputs.upload_release == 'true' || github.event.inputs.upload_release == '')
+        with:
+          name: "RAX3000ME 固件 ${{ steps.date.outputs.date }} #${{ github.run_number }}"
+          tag_name: "build-${{ steps.date.outputs.date }}-${{ github.run_number }}"
+          body: |
+            ## 📦 RAX3000ME ImmortalWrt 25.12 自动编译固件
+
+            | 项目 | 内容 |
+            |------|------|
+            | 编译时间 | ${{ steps.date.outputs.datetime }} (北京时间) |
+            | 编译编号 | #${{ github.run_number }} |
+            | 设备 | CMCC RAX3000ME (eMMC) |
+            | 内核版本 | 6.12（25.12 版本）|
+            | 源码分支 | `${{ env.REPO_BRANCH }}` |
+
+            ### 🔌 集成插件
+            - OpenClash（透明代理）
+            - 磁盘管理（DiskMan）
+            - Argon 主题
+            - 更多插件见 `.config` 配置
+
+            ### 📋 刷机说明
+            1. 下载对应设备的固件文件（`sysupgrade.bin` 用于升级，`factory.bin` 用于首次刷入）
+            2. 刷入前请对比 `sha256sums.txt` 校验文件完整性
+            3. 默认管理地址：`192.168.1.1`，用户名：`root`，密码：无
+
+            > ⚠️ 刷机有风险，请确认固件适配你的设备型号再操作
+          files: openwrt/bin/targets/mediatek/filogic/*
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
